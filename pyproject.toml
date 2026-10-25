@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-stego"
+version = "0.1.0"
+description = "Neural Audio Steganography System"
+authors = [{ name = "Neural Stego Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "torchaudio>=2.2.0",
+    "numpy>=1.26.0",
+    "soundfile>=0.12.1",
+    "reedsolo>=1.7.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ml*", "backend*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests", "backend/tests"]

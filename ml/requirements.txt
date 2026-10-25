@@ -1,0 +1,5 @@
+torch>=2.2.0,<2.7.0
+torchaudio>=2.2.0,<2.7.0
+numpy>=1.26.0,<2.3.0
+soundfile>=0.12.1
+reedsolo>=1.7.0

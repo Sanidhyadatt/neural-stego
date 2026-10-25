@@ -1,0 +1,9 @@
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.28.0,<1.0.0
+python-multipart>=0.0.9
+pydantic>=2.6.0,<3.0.0
+torch>=2.2.0,<2.7.0
+torchaudio>=2.2.0,<2.7.0
+numpy>=1.26.0,<2.3.0
+soundfile>=0.12.1
+reedsolo>=1.7.0

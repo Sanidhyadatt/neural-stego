@@ -1,0 +1,68 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+*.obj
+*.o
+*.pyd
+
+# Environments and packages
+.venv/
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Monorepo artifacts and checkpoints
+checkpoints/*
+!checkpoints/.gitkeep
+data/*
+!data/.gitkeep
+*.pt
+*.pth
+*.bin
+*.tar.gz
+
+# Frontend dependencies and builds
+node_modules/
+.next/
+out/
+.vercel
+.env
+.env.*
+.env.local
+!.env.example
+
+# Testing & Linters
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.log
