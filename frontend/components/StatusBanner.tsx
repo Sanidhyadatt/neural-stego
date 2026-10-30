@@ -4,13 +4,14 @@ import React from "react";
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 
 interface StatusBannerProps {
+  id?: string;
   type: "success" | "error" | "info" | "warning";
   message: string;
   details?: string;
   onClose?: () => void;
 }
 
-export function StatusBanner({ type, message, details, onClose }: StatusBannerProps) {
+export function StatusBanner({ id, type, message, details, onClose }: StatusBannerProps) {
   if (!message) return null;
 
   const styles = {
@@ -34,8 +35,10 @@ export function StatusBanner({ type, message, details, onClose }: StatusBannerPr
 
   return (
     <div
+      id={id}
       role="alert"
-      aria-live="polite"
+      aria-live={type === "error" ? "assertive" : "polite"}
+      aria-atomic="true"
       className={`w-full rounded-lg border p-4 backdrop-blur-md transition-all shadow-lg ${styles.bg}`}
     >
       <div className="flex items-start gap-3">

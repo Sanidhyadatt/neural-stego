@@ -62,15 +62,18 @@ export function RevealTab() {
         accent="emerald"
       />
 
-      {/* Error or Alert banner */}
-      {error && (
-        <StatusBanner
-          type="error"
-          message={error.message}
-          details={error.details}
-          onClose={() => setError(null)}
-        />
-      )}
+      {/* Persistent aria-live error state region */}
+      <div aria-live="assertive" aria-atomic="true">
+        {error && (
+          <StatusBanner
+            id="reveal-error-banner"
+            type="error"
+            message={error.message}
+            details={error.details}
+            onClose={() => setError(null)}
+          />
+        )}
+      </div>
 
       {/* Action Button */}
       <button

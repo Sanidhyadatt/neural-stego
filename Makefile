@@ -15,7 +15,7 @@ setup:
 	cd frontend && npm install
 
 train:
-	python -m ml.train --epochs 20 --batch-size 16 --data-dir data --checkpoint-dir checkpoints
+	python -m ml.train --steps 20000 --batch-size 16 --data-dir data --ckpt-dir checkpoints
 
 api:
 	python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload

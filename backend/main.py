@@ -15,20 +15,21 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, Optional
+from typing import Optional
 
 # Ensure repository root is on sys.path for clean, robust imports across environments
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from ml.audio_utils import load_audio
+from ml.audio_utils import load_audio, split_chunks
 from ml.config import SAMPLE_RATE, SUPPORTED_INPUT_EXTENSIONS
 from ml.inference import StegoEngine
+from ml.text_codec import max_text_bytes
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,17 +38,40 @@ logger = logging.getLogger("neural-stego-api")
 # Constraints
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB limit
 MAX_AUDIO_DURATION_SEC = 300.0  # 5 minutes
+HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+DEFAULT_CORS_ORIGINS = "http://localhost:3000"
+CORS_ORIGIN_REGEX = r"https://.*\.trycloudflare\.com"
+EXPOSED_HEADERS = ["X-Snr-Db", "X-Chunks", "X-Duration"]
 
 # Global StegoEngine instance managed via lifespan
 engine: Optional[StegoEngine] = None
+router = APIRouter()
+
+
+def resolve_checkpoint_path() -> Path:
+    """Resolve checkpoint path from STEGO_CHECKPOINT or default best/latest paths."""
+    ckpt_env = os.environ.get("STEGO_CHECKPOINT")
+    if ckpt_env and ckpt_env.strip():
+        return Path(ckpt_env.strip())
+    best_ckpt = Path("checkpoints/stego_best.pt")
+    if best_ckpt.exists():
+        return best_ckpt
+    return Path("checkpoints/stego.pt")
+
+
+def get_allowed_origins() -> list[str]:
+    """Parse comma-separated allowed origins from STEGO_CORS_ORIGINS."""
+    cors_origins_env = os.environ.get("STEGO_CORS_ORIGINS")
+    if cors_origins_env is None or not cors_origins_env.strip():
+        cors_origins_env = DEFAULT_CORS_ORIGINS
+    return [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown lifecycle, preloading the StegoEngine."""
     global engine
-    ckpt_env = os.environ.get("STEGO_CHECKPOINT", "checkpoints/stego.pt")
-    ckpt_path = Path(ckpt_env)
+    ckpt_path = resolve_checkpoint_path()
 
     if ckpt_path.is_file():
         try:
@@ -68,26 +92,27 @@ async def lifespan(app: FastAPI):
     engine = None
 
 
-app = FastAPI(
-    title="Neural Audio Steganography API",
-    description="High-performance GAN-based audio steganography service",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    application = FastAPI(
+        title="Neural Audio Steganography API",
+        description="High-performance GAN-based audio steganography service",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
 
-# Configure CORS
-cors_origins_env = os.environ.get("STEGO_CORS_ORIGINS", "http://localhost:3000")
-allowed_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=get_allowed_origins(),
+        allow_origin_regex=CORS_ORIGIN_REGEX,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=EXPOSED_HEADERS,
+    )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.trycloudflare\.com",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Snr-Db", "X-Chunks", "X-Duration"],
-)
+    application.include_router(router)
+    return application
 
 
 # Response Models
@@ -142,17 +167,17 @@ def _check_engine_available() -> StegoEngine:
     return engine
 
 
-@app.get("/health", response_model=HealthResponse)
+@router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Check API operational status and whether model weights are loaded."""
     is_loaded = engine is not None and engine.encoder is not None
     return HealthResponse(status="ok", model_loaded=is_loaded)
 
 
-@app.post("/api/capacity", response_model=CapacityResponse)
+@router.post("/api/capacity", response_model=CapacityResponse)
 async def check_capacity(file: UploadFile = File(...)) -> CapacityResponse:
     """Compute maximum character capacity and duration for an audio file."""
-    active_engine = _check_engine_available()
+    _check_engine_available()
     content = await file.read()
     _validate_upload(file, content)
 
@@ -171,14 +196,15 @@ async def check_capacity(file: UploadFile = File(...)) -> CapacityResponse:
             detail=f"Audio duration ({duration_sec:.1f}s) exceeds the 5-minute limit (300s).",
         )
 
-    max_chars = await asyncio.to_thread(active_engine.capacity, content)
+    chunks, _ = split_chunks(wave)
+    max_chars = max_text_bytes(chunks.shape[0])
     return CapacityResponse(
         max_chars=max_chars,
         duration_sec=round(duration_sec, 2),
     )
 
 
-@app.post("/api/embed")
+@router.post("/api/embed")
 async def embed_message(
     file: UploadFile = File(...),
     message: str = Form(...),
@@ -188,10 +214,10 @@ async def embed_message(
     content = await file.read()
     _validate_upload(file, content)
 
-    # Validate message length
+    # Validate message is non-empty
     if len(message.strip()) == 0:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail="Message must not be empty.",
         )
 
@@ -210,23 +236,12 @@ async def embed_message(
             detail=f"Audio duration ({duration_sec:.1f}s) exceeds the 5-minute limit (300s).",
         )
 
-    max_chars = await asyncio.to_thread(active_engine.capacity, content)
-    # Validate against capacity (character count / UTF-8 byte length)
-    if len(message.encode("utf-8")) > max_chars:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Message length ({len(message)} chars) exceeds maximum capacity "
-                f"of {max_chars} characters for this audio file."
-            ),
-        )
-
     try:
-        # Run inference in threadpool to keep FastAPI async event loop unblocked
+        # Run inference in threadpool; StegoEngine validates capacity / block count
         wav_bytes, info = await asyncio.to_thread(active_engine.embed, content, message)
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail=str(exc),
         )
     except Exception as exc:
@@ -248,7 +263,7 @@ async def embed_message(
     )
 
 
-@app.post("/api/extract", response_model=ExtractResponse)
+@router.post("/api/extract", response_model=ExtractResponse)
 async def extract_message(file: UploadFile = File(...)) -> ExtractResponse:
     """Extract concealed secret text from stego audio file."""
     active_engine = _check_engine_available()
@@ -275,9 +290,8 @@ async def extract_message(file: UploadFile = File(...)) -> ExtractResponse:
         extracted_text = await asyncio.to_thread(active_engine.extract, content)
         return ExtractResponse(message=extracted_text)
     except ValueError:
-        # Reed-Solomon unrecoverable error
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=HTTP_422,
             detail="No readable message found. The file may not contain a hidden message, or it was altered after embedding.",
         )
     except Exception as exc:
@@ -285,3 +299,6 @@ async def extract_message(file: UploadFile = File(...)) -> ExtractResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to extract message: {exc}",
         )
+
+
+app = create_app()

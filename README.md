@@ -12,9 +12,8 @@ A production-grade full-stack framework for concealing secret text payloads impe
           ▼
 ┌────────────────────────────────────────┐
 │  Text Codec & Framing (ml/text_codec)  │
-│  - UTF-8 serialization                 │
-│  - 2-byte Big-Endian Length Header     │
-│  - Reed-Solomon FEC (8 Parity Bytes)   │
+│  - 1B Magic (0x53) + 1B Length + UTF-8 │
+│  - 2B CRC16 + Reed-Solomon (8 Parity)  │
 │  - Pad to 16-Byte Block (128 bits/2s)  │
 └──────────────────┬─────────────────────┘
                    │
@@ -98,8 +97,8 @@ neural-stego/
 | **STFT Dimensions** | `n_fft=1024`, `hop_length=256`, `win_length=1024`, Hann, `center=True` |
 | **Spectrogram Tensor** | 2 channels `(real, imag)`, shape `[B, 2, 513, 126]` |
 | **Payload Capacity** | 128 bits (16 bytes) per 2-second audio chunk |
-| **Protocol Overhead**| 2 bytes length header + 8 bytes Reed-Solomon parity = 10 bytes |
-| **Usable Payload**   | `(n_chunks * 16) - 10` bytes (e.g. 6 bytes for 2s, 22 bytes for 4s) |
+| **Protocol Overhead**| 1B magic + 1B length + 2B CRC16 + 8B Reed-Solomon parity = 12 bytes |
+| **Usable Payload**   | `(n_chunks * 16) - 12` bytes (max 255 bytes; e.g. 4B for 2s, 20B for 4s) |
 | **Input Formats**    | WAV, MP3, FLAC, OGG (converted automatically to 16 kHz mono) |
 | **Output Format**   | 16-bit PCM WAV (`PCM_16`) |
 
@@ -279,10 +278,10 @@ Please note the following technical and operational constraints:
    - While the perturbations are mathematically imperceptible to human hearing and fool the co-trained discriminator, **resistance against specialized forensic steganalysis tools or advanced statistical audio steganalysis cannot be guaranteed.**
 3. **Payload Capacity Constraints**:
    - The physical capacity is **128 bits (16 bytes)** per 2.0-second audio chunk.
-   - To guarantee transmission integrity, framing overhead uses **2 bytes** for the payload length header and **8 bytes** for Reed-Solomon forward error correction parity.
+   - To guarantee transmission integrity, framing overhead uses **1 byte** magic (`0x53`), **1 byte** payload length (max 255), **2 bytes** CRC16, and **8 bytes** for Reed-Solomon forward error correction parity (**12 bytes** total).
    - Consequently, the net usable text capacity is:
-     $$\text{Capacity (bytes)} = (N_{\text{chunks}} \times 16) - 10$$
-     - 1 chunk (2.0s): **6 bytes** (6 characters)
-     - 2 chunks (4.0s): **22 bytes** (22 characters)
-     - 3 chunks (6.0s): **38 bytes** (38 characters)
+     $$\text{Capacity (bytes)} = \min(255, (N_{\text{chunks}} \times 16) - 12)$$
+     - 1 chunk (2.0s): **4 bytes**
+     - 2 chunks (4.0s): **20 bytes**
+     - 3 chunks (6.0s): **36 bytes**
      - Audio shorter than 2 seconds cannot store a message with full Reed-Solomon protection.

@@ -1,9 +1,9 @@
-"""Unit tests for audio processing and text codec utilities."""
+"""Unit tests for audio processing and message framing text codec."""
 
-import random
-import numpy as np
+import reedsolo
 import pytest
 import torch
+import numpy as np
 
 from ml.audio_utils import (
     istft,
@@ -13,10 +13,13 @@ from ml.audio_utils import (
     split_chunks,
     stft,
 )
-from ml.config import CHUNK_SAMPLES, FREQ_BINS, N_FRAMES, STFT_CHANNELS
+from ml.config import CHUNK_SAMPLES, FREQ_BINS, N_FRAMES, PAYLOAD_BITS, STFT_CHANNELS
 from ml.text_codec import (
+    MAGIC_BYTE,
+    RS_PARITY_BYTES,
     chunk_bits_to_text,
-    max_text_length,
+    crc16,
+    max_text_bytes,
     text_to_chunk_bits,
 )
 
@@ -25,8 +28,7 @@ def test_stft_istft_roundtrip():
     """Verify STFT to iSTFT reconstruction roundtrip error is < 1e-4."""
     batch_size = 4
     torch.manual_seed(42)
-    # Generate random audio batch in [-0.5, 0.5]
-    wave_batch = (torch.rand(batch_size, CHUNK_SAMPLES, dtype=torch.float32) - 0.5)
+    wave_batch = torch.rand(batch_size, CHUNK_SAMPLES, dtype=torch.float32) - 0.5
 
     spec = stft(wave_batch)
     assert spec.shape == (batch_size, STFT_CHANNELS, FREQ_BINS, N_FRAMES)
@@ -52,84 +54,111 @@ def test_split_merge_chunks():
         expected_chunks = (length + CHUNK_SAMPLES - 1) // CHUNK_SAMPLES
         assert chunks.shape == (expected_chunks, CHUNK_SAMPLES)
 
-        # Check zero-padding in last chunk if length wasn't an exact multiple
         remainder = length % CHUNK_SAMPLES
         if remainder != 0:
             padded_tail = chunks[-1, remainder:]
             assert torch.all(padded_tail == 0.0)
 
-        # Merge back and verify signal
         merged = merge_chunks(chunks, orig_len)
         assert merged.shape == wave.shape
         assert torch.equal(merged, wave)
 
 
-def test_text_roundtrip():
-    """Verify text encoding and decoding for 'hello', 100-char string, and emoji string."""
-    test_strings = [
-        "hello",
-        "The quick brown fox jumps over the lazy dog. A neural steganography system hides data imperceptibly.",
-        "Audio steganography with emojis! 🎵🎧🔒🚀✨",
-    ]
+def test_text_codec_roundtrip():
+    """Verify codec roundtrip for 'hi', a 100-character string, and an emoji string."""
+    hundred_char_str = "0123456789" * 10
+    assert len(hundred_char_str) == 100
 
-    for text in test_strings:
+    emoji_str = "Audio steganography with emojis! 🎵🎧🔒🚀✨"
+
+    for text in ["hi", hundred_char_str, emoji_str]:
         bits = text_to_chunk_bits(text)
         assert bits.ndim == 2
-        assert bits.shape[1] == 128
+        assert bits.shape[1] == PAYLOAD_BITS
         assert torch.all((bits == 0.0) | (bits == 1.0))
+
+        # Verify raw frame prefix starts with magic 0x53 and UTF-8 byte length
+        raw_bytes = bytes(np.packbits(bits.numpy().astype(np.uint8).reshape(-1)).tobytes())
+        payload_utf8 = text.encode("utf-8")
+        assert raw_bytes[0] == MAGIC_BYTE
+        assert raw_bytes[1] == len(payload_utf8)
 
         recovered = chunk_bits_to_text(bits)
         assert recovered == text, f"Failed roundtrip for text: {text!r}"
 
 
-def test_random_bit_flips_recovery():
-    """Verify that flipping 3 random bits in encoded payload still decodes correctly."""
+def test_corrupt_25_percent_of_bits_in_one_block_recovers():
+    """Verify corrupting 25% of the bits (32 bits / 4 bytes) in one block still recovers."""
     messages = [
-        "Secret message 123!",
-        "Robust error correction test with Reed-Solomon parity.",
+        "hi",
+        "0123456789" * 10,
+        "Emoji recovery! 🎵🎧🔒",
     ]
 
     for msg in messages:
         bits = text_to_chunk_bits(msg)
-        total_bits = bits.numel()
+        # Corrupt 25% of block 0 (first 32 bits = 4 bytes, including magic & length!)
+        corrupted_header_block = bits.clone()
+        corrupted_header_block[0, :32] = 1.0 - corrupted_header_block[0, :32]
+        assert chunk_bits_to_text(corrupted_header_block) == msg
 
-        # Run multiple random flip trials
-        for seed in [10, 20, 30, 40, 50]:
-            rng = random.Random(seed)
-            flip_indices = rng.sample(range(total_bits), 3)
-
-            corrupted_bits = bits.clone().view(-1)
-            for idx in flip_indices:
-                corrupted_bits[idx] = 1.0 - corrupted_bits[idx]
-
-            corrupted_bits = corrupted_bits.view(bits.shape)
-            recovered = chunk_bits_to_text(corrupted_bits)
-            assert recovered == msg, (
-                f"Failed to recover {msg!r} after flipping bits {flip_indices}"
-            )
+        # Also corrupt 25% of the last block (middle 32 bits = bytes 4..7)
+        corrupted_last_block = bits.clone()
+        corrupted_last_block[-1, 32:64] = 1.0 - corrupted_last_block[-1, 32:64]
+        assert chunk_bits_to_text(corrupted_last_block) == msg
 
 
-def test_max_text_length():
-    """Verify max_text_length boundary calculation and enforcement."""
-    # 1 chunk = 16 bytes. Overhead = 2 (header) + 8 (RS) = 10 bytes. Capacity = 6 bytes.
-    assert max_text_length(1) == 6
-    assert max_text_length(2) == 22
-    assert max_text_length(0) == 0
+def test_magic_and_crc_required_for_decode():
+    """Verify decoding fails unless RS decodes AND magic matches AND CRC passes."""
+    rsc = reedsolo.RSCodec(RS_PARITY_BYTES)
+    payload = b"hello"
+    valid_crc = crc16(payload).to_bytes(2, "big")
 
-    valid_text_1_chunk = "123456"  # exactly 6 bytes
-    bits = text_to_chunk_bits(valid_text_1_chunk, n_chunks=1)
+    # 1. Wrong magic byte (0x54 instead of 0x53), valid RS and valid CRC
+    bad_magic_frame = bytes([0x54, len(payload)]) + payload + valid_crc
+    encoded_bad_magic = bytes(rsc.encode(bad_magic_frame)).ljust(32, b"\x00")
+    bits_bad_magic = torch.from_numpy(
+        np.unpackbits(np.frombuffer(encoded_bad_magic, dtype=np.uint8)).copy()
+    ).float().view(2, 128)
+    with pytest.raises(ValueError, match="Message could not be recovered"):
+        chunk_bits_to_text(bits_bad_magic)
+
+    # 2. Valid magic byte (0x53) and valid RS, but wrong CRC16
+    bad_crc = ((crc16(payload) ^ 0xFFFF) & 0xFFFF).to_bytes(2, "big")
+    bad_crc_frame = bytes([MAGIC_BYTE, len(payload)]) + payload + bad_crc
+    encoded_bad_crc = bytes(rsc.encode(bad_crc_frame)).ljust(32, b"\x00")
+    bits_bad_crc = torch.from_numpy(
+        np.unpackbits(np.frombuffer(encoded_bad_crc, dtype=np.uint8)).copy()
+    ).float().view(2, 128)
+    with pytest.raises(ValueError, match="Message could not be recovered"):
+        chunk_bits_to_text(bits_bad_crc)
+
+
+def test_max_text_bytes():
+    """Verify max_text_bytes(n_chunks) = n_chunks*16 - 12 and boundary enforcement."""
+    assert max_text_bytes(0) == 0
+    assert max_text_bytes(1) == 4
+    assert max_text_bytes(2) == 20
+    assert max_text_bytes(3) == 36
+    assert max_text_bytes(7) == 100
+    assert max_text_bytes(30) == 255  # 1-byte length cap
+
+    valid_1_chunk = "abcd"  # 4 bytes
+    bits = text_to_chunk_bits(valid_1_chunk, n_chunks=1)
     assert bits.shape == (1, 128)
-    assert chunk_bits_to_text(bits) == valid_text_1_chunk
+    assert chunk_bits_to_text(bits) == valid_1_chunk
 
-    invalid_text_1_chunk = "1234567"  # 7 bytes exceeds 6
     with pytest.raises(ValueError):
-        text_to_chunk_bits(invalid_text_1_chunk, n_chunks=1)
+        text_to_chunk_bits("abcde", n_chunks=1)  # 5 bytes > 4
+
+    with pytest.raises(ValueError):
+        text_to_chunk_bits("x" * 256)  # exceeds 255-byte frame limit
 
 
 def test_save_and_load_audio():
     """Verify audio serialization to 16-bit PCM WAV and deserialization."""
     torch.manual_seed(999)
-    original_wave = (torch.rand(32000, dtype=torch.float32) * 1.8 - 0.9)  # in [-0.9, 0.9]
+    original_wave = torch.rand(32000, dtype=torch.float32) * 1.8 - 0.9
 
     wav_bytes = save_wav_bytes(original_wave)
     assert isinstance(wav_bytes, bytes)
@@ -137,13 +166,12 @@ def test_save_and_load_audio():
 
     loaded_wave = load_audio(wav_bytes)
     assert loaded_wave.shape == original_wave.shape
-    # 16-bit PCM quantization error is ~ 1 / 32768 ~= 3e-5
     assert torch.allclose(loaded_wave, original_wave, atol=1e-4)
 
 
 def test_unrecoverable_message_raises():
-    """Verify that completely corrupted or random bit payloads raise ValueError."""
-    # 128 random bits
-    random_bits = torch.randint(0, 2, (1, 128)).float()
+    """Verify that random bit payloads raise ValueError('Message could not be recovered')."""
+    torch.manual_seed(7)
+    random_bits = torch.randint(0, 2, (2, 128)).float()
     with pytest.raises(ValueError, match="Message could not be recovered"):
         chunk_bits_to_text(random_bits)

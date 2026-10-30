@@ -1,10 +1,11 @@
 """Dataset module for Neural Audio Steganography.
 
 Provides:
-- StegoDataset: PyTorch Dataset extracting random 2-second peak-normalized audio chunks
-  and paired 128-bit random secret messages.
+- StegoDataset: PyTorch Dataset scanning one or multiple audio directories, holding out
+  2% of files as a validation split, skipping silent chunks (RMS < 0.005), applying
+  peak normalization and random training gain, and pairing with 128-bit random payloads.
 - generate_synthetic_data: Generates mixed sine waves + noise WAV files for smoke tests
-  and offline training/verification.
+  and offline verification.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import random
-from typing import List, Optional, Tuple, Union
+from typing import List, Sequence, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -29,6 +30,8 @@ from ml.config import (
 
 MIN_AUDIO_DURATION_SEC = 0.5
 MIN_AUDIO_SAMPLES = int(MIN_AUDIO_DURATION_SEC * SAMPLE_RATE)  # 8000 samples
+MIN_CHUNK_RMS = 0.005
+VAL_HOLDOUT_RATIO = 0.02
 
 
 def generate_synthetic_data(
@@ -50,16 +53,13 @@ def generate_synthetic_data(
     out_path.mkdir(parents=True, exist_ok=True)
     generated_files: List[Path] = []
 
-    # Deterministic generation for reproducibility
     rng = np.random.RandomState(42)
 
     for i in range(num_files):
-        # Durations between 3.0 and 5.0 seconds
         duration = rng.uniform(3.0, 5.0)
         num_samples = int(duration * sample_rate)
         t = np.linspace(0.0, duration, num_samples, endpoint=False, dtype=np.float32)
 
-        # 3 random harmonically rich frequencies
         f1 = rng.uniform(150.0, 400.0)
         f2 = rng.uniform(400.0, 1000.0)
         f3 = rng.uniform(1000.0, 2500.0)
@@ -74,11 +74,9 @@ def generate_synthetic_data(
             + 0.2 * np.sin(2 * np.pi * f3 * t + phase3)
         )
 
-        # Subtle white noise
         noise = rng.normal(0.0, 0.05, num_samples).astype(np.float32)
         combined = signal + noise
 
-        # Peak normalize to 0.90
         peak = np.max(np.abs(combined))
         if peak > 1e-6:
             combined = (combined / peak) * 0.90
@@ -99,135 +97,157 @@ def generate_synthetic_data(
 class StegoDataset(Dataset[Tuple[torch.Tensor, torch.Tensor]]):
     """Audio Steganography Dataset.
 
-    Recursively scans audio files, verifies minimum duration of 0.5s, and extracts
-    random 2-second chunks (32,000 samples) paired with 128-bit random message tensors.
+    Scans one or multiple root directories for audio files, holds out 2% of files for
+    validation, skips silent chunks (RMS < 0.005), peak-normalizes chunks, applies random
+    gain on training chunks, and pairs each chunk with a random 128-bit payload.
 
     Args:
-        root_dir: Root directory containing audio files.
-        split: Dataset split ('train', 'val', 'test', or 'all').
+        root_dir: Single directory path or sequence of directory paths containing audio files.
+        split: Dataset split ('train', 'val', or 'all').
         auto_generate_synthetic: If True and root_dir has no files, generate synthetic data.
     """
 
     def __init__(
         self,
-        root_dir: Union[str, Path],
+        root_dir: Union[str, Path, Sequence[Union[str, Path]]],
         split: str = "train",
         auto_generate_synthetic: bool = True,
     ) -> None:
         super().__init__()
-        self.root_dir = Path(root_dir)
+        if isinstance(root_dir, (str, Path)):
+            self.root_dirs: List[Path] = [Path(root_dir)]
+        else:
+            self.root_dirs = [Path(p) for p in root_dir]
+        if not self.root_dirs:
+            raise ValueError("At least one root_dir must be provided.")
+
+        self.root_dir = self.root_dirs[0]
         self.split = split.lower()
         self.file_list: List[Path] = []
 
-        # Collect files
-        all_found = self._scan_audio_files(self.root_dir)
+        all_found = self._scan_audio_dirs(self.root_dirs)
 
         if len(all_found) == 0 and auto_generate_synthetic:
-            # Generate 20 synthetic files into root_dir / "synthetic"
-            synthetic_dir = self.root_dir / "synthetic"
+            synthetic_dir = self.root_dirs[0] / "synthetic"
             generate_synthetic_data(synthetic_dir, num_files=20)
-            all_found = self._scan_audio_files(self.root_dir)
+            all_found = self._scan_audio_dirs(self.root_dirs)
 
         if len(all_found) == 0:
             raise FileNotFoundError(
-                f"No supported audio files {SUPPORTED_INPUT_EXTENSIONS} found in {self.root_dir}."
+                f"No supported audio files {SUPPORTED_INPUT_EXTENSIONS} found in {self.root_dirs}."
             )
 
-        # Partition files based on split
         self.file_list = self._partition_split(all_found, self.split)
 
-    def _scan_audio_files(self, root: Path) -> List[Path]:
-        """Recursively search for supported audio files and cache valid candidates."""
-        if not root.exists():
-            return []
-
+    def _scan_audio_dirs(self, roots: Sequence[Path]) -> List[Path]:
+        """Recursively scan multiple directories for supported non-empty audio files."""
+        seen: set[Path] = set()
         candidates: List[Path] = []
         extensions = set(SUPPORTED_INPUT_EXTENSIONS)
 
-        for dirpath, _, filenames in os.walk(root):
-            for fname in filenames:
-                ext = Path(fname).suffix.lower()
-                if ext in extensions:
-                    candidate = Path(dirpath) / fname
-                    # Fast check: skip zero-byte or unreadable files
-                    if candidate.stat().st_size > 0:
-                        candidates.append(candidate)
+        for root in roots:
+            if not root.exists():
+                continue
+            for dirpath, _, filenames in os.walk(root):
+                for fname in filenames:
+                    ext = Path(fname).suffix.lower()
+                    if ext in extensions:
+                        candidate = Path(dirpath) / fname
+                        resolved = candidate.resolve()
+                        if resolved not in seen and candidate.stat().st_size > 0:
+                            seen.add(resolved)
+                            candidates.append(candidate)
 
-        return sorted(candidates)
+        return sorted(candidates, key=lambda p: str(p))
 
     def _partition_split(self, files: List[Path], split: str) -> List[Path]:
-        """Split file list into train/val/test partitions."""
-        # If a dedicated subfolder for the split exists, use those files
-        split_dir = self.root_dir / split
-        if split_dir.is_dir():
-            split_files = [f for f in files if split_dir in f.parents or f.parent == split_dir]
-            if len(split_files) > 0:
-                return split_files
-
-        if split == "all" or len(files) <= 2:
+        """Partition sorted file list into first 98% train and last 2% validation splits."""
+        if split == "all" or len(files) <= 1:
             return files
 
         n_total = len(files)
-        n_train = max(1, int(0.80 * n_total))
-        n_val = max(1, int(0.10 * n_total))
+        n_val = max(1, int(round(VAL_HOLDOUT_RATIO * n_total)))
+        n_val = min(n_val, n_total - 1)
 
-        if split == "train":
-            return files[:n_train]
-        elif split in ("val", "valid", "validation"):
-            return files[n_train : n_train + n_val]
-        elif split == "test":
-            return files[n_train + n_val :]
+        if split in ("val", "valid", "validation"):
+            return files[-n_val:]
+        elif split == "train":
+            return files[:-n_val]
         else:
             return files
 
     def __len__(self) -> int:
         return len(self.file_list)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load audio chunk and paired message bits.
+    @staticmethod
+    def _extract_non_silent_chunk(wave: torch.Tensor, max_tries: int = 8) -> torch.Tensor | None:
+        """Sample a 2-second chunk from wave whose RMS is at least MIN_CHUNK_RMS (0.005)."""
+        audio_len = wave.shape[0]
+        if audio_len <= CHUNK_SAMPLES:
+            pad_len = CHUNK_SAMPLES - audio_len
+            chunk = (
+                torch.nn.functional.pad(wave, (0, pad_len), mode="constant", value=0.0)
+                if pad_len > 0
+                else wave
+            )
+            rms = float(torch.sqrt(torch.mean(chunk ** 2)).item())
+            return chunk if rms >= MIN_CHUNK_RMS else None
 
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - audio_chunk: [32000] float32 tensor peak-normalized.
-                - message_bits: [128] float32 binary tensor {0.0, 1.0}.
-        """
-        for _ in range(5):  # Max 5 fallback retries if an audio file is too short
+        max_offset = audio_len - CHUNK_SAMPLES
+        for _ in range(max_tries):
+            start_offset = random.randint(0, max_offset)
+            chunk = wave[start_offset : start_offset + CHUNK_SAMPLES]
+            rms = float(torch.sqrt(torch.mean(chunk ** 2)).item())
+            if rms >= MIN_CHUNK_RMS:
+                return chunk
+
+        return None
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load non-silent audio chunk, peak-normalize, apply random train gain, and pair bits."""
+        is_train = self.split == "train"
+
+        for _ in range(10):
             file_path = self.file_list[idx]
             try:
                 wave = load_audio(file_path)
             except Exception:
-                # If corrupted, pick another index
                 idx = random.randint(0, len(self.file_list) - 1)
                 continue
 
-            # Skip files shorter than 0.5 s (8000 samples)
             if wave.shape[0] < MIN_AUDIO_SAMPLES:
                 idx = random.randint(0, len(self.file_list) - 1)
                 continue
 
-            # Extract random 2-second chunk (32,000 samples)
-            audio_len = wave.shape[0]
-            if audio_len > CHUNK_SAMPLES:
-                max_offset = audio_len - CHUNK_SAMPLES
-                start_offset = random.randint(0, max_offset)
-                chunk = wave[start_offset : start_offset + CHUNK_SAMPLES]
+            chunk = self._extract_non_silent_chunk(wave)
+            if chunk is None:
+                idx = random.randint(0, len(self.file_list) - 1)
+                continue
+
+            # Peak normalization to unit peak
+            peak = float(chunk.abs().max().item())
+            if peak <= 1e-6:
+                idx = random.randint(0, len(self.file_list) - 1)
+                continue
+            chunk = chunk / peak
+
+            if is_train:
+                # Apply random gain on each training chunk while ensuring RMS stays >= 0.005
+                norm_rms = float(torch.sqrt(torch.mean(chunk ** 2)).item())
+                min_gain = min(0.95, max(0.25, (MIN_CHUNK_RMS * 1.1) / max(norm_rms, 1e-6)))
+                gain = random.uniform(min_gain, 0.98)
+                chunk = chunk * gain
             else:
-                # Zero-pad if shorter than 2 seconds
-                pad_len = CHUNK_SAMPLES - audio_len
-                chunk = torch.nn.functional.pad(wave, (0, pad_len), mode="constant", value=0.0)
+                chunk = chunk * 0.95
 
-            # Peak-normalize to 0.95
-            peak = chunk.abs().max()
-            if peak > 1e-6:
-                chunk = (chunk / peak) * 0.95
-
-            # Random 128-bit secret message
+            chunk = chunk.clamp(-1.0, 1.0)
             message_bits = torch.randint(0, 2, (PAYLOAD_BITS,)).float()
-
             return chunk, message_bits
 
-        # Fallback if multiple files failed: return synthetic sine wave
-        t = torch.linspace(0, 2.0, CHUNK_SAMPLES)
-        chunk = 0.5 * torch.sin(2 * np.pi * 440.0 * t)
+        # Fallback non-silent synthetic harmonic chunk if every sampled file was silent/invalid
+        t = torch.linspace(0.0, 2.0, CHUNK_SAMPLES, dtype=torch.float32)
+        chunk = 0.5 * torch.sin(2.0 * np.pi * 440.0 * t)
+        if is_train:
+            chunk = chunk * random.uniform(0.5, 0.98)
         message_bits = torch.randint(0, 2, (PAYLOAD_BITS,)).float()
         return chunk, message_bits

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ml.audio_utils import (
     istft,
@@ -26,12 +27,13 @@ from ml.audio_utils import (
     stft,
 )
 from ml.config import (
+    CHUNK_DURATION_SEC,
     CHUNK_SAMPLES,
     PAYLOAD_BITS,
     SAMPLE_RATE,
 )
 from ml.models import Decoder, Encoder
-from ml.text_codec import chunk_bits_to_text, max_text_length, text_to_chunk_bits
+from ml.text_codec import chunk_bits_to_text, max_text_bytes, text_to_chunk_bits
 from ml.train import get_device
 
 
@@ -73,15 +75,20 @@ class StegoEngine:
 
         ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config", {})
+        ema_state = ckpt.get("ema") if isinstance(ckpt.get("ema"), dict) else {}
+
         payload_bits = cfg.get("payload_bits", PAYLOAD_BITS)
         base = cfg.get("base", 32)
-        alpha = cfg.get("alpha", 0.02)
+        alpha = ema_state.get("alpha", cfg.get("alpha", 0.02))
 
         self.encoder = Encoder(payload_bits=payload_bits, base=base, alpha=alpha).to(self.device)
         self.decoder = Decoder(payload_bits=payload_bits, base=base).to(self.device)
 
-        self.encoder.load_state_dict(ckpt["encoder"])
-        self.decoder.load_state_dict(ckpt["decoder"])
+        encoder_weights = ema_state.get("encoder") or ckpt.get("ema_encoder") or ckpt["encoder"]
+        decoder_weights = ema_state.get("decoder") or ckpt.get("ema_decoder") or ckpt["decoder"]
+
+        self.encoder.load_state_dict(encoder_weights)
+        self.decoder.load_state_dict(decoder_weights)
 
         self.encoder.eval()
         self.decoder.eval()
@@ -109,7 +116,8 @@ class StegoEngine:
                 - info: Execution metadata with n_chunks, duration_sec, snr_db, capacity_chars.
 
         Raises:
-            ValueError: If message requires more chunks than available in the audio.
+            ValueError: If message requires more blocks than available chunks in the audio,
+                or exceeds codec maximum payload length.
         """
         if self.encoder is None:
             self.load()
@@ -123,27 +131,21 @@ class StegoEngine:
         # 2. Split into 2-second chunks (32,000 samples)
         chunks, original_length = split_chunks(wave)
         n_chunks = chunks.shape[0]
-        capacity_chars = max_text_length(n_chunks)
+        capacity_chars = max_text_bytes(n_chunks)
 
-        # 3. Convert text to chunk bit blocks [M, 128]
+        # 3. Convert text to 16-byte message blocks [n_blocks, 128]
         text_bits = text_to_chunk_bits(text)
-        n_text_chunks = text_bits.shape[0]
+        n_blocks = text_bits.shape[0]
 
-        # 4. Check capacity bounds
-        if n_text_chunks > n_chunks:
+        # 4. Check block count against available audio chunks
+        if n_blocks > n_chunks:
+            needed_sec = int(n_blocks * CHUNK_DURATION_SEC)
             raise ValueError(
-                f"Text requires {n_text_chunks} chunks ({n_text_chunks * 128} bits), "
-                f"but audio only provides {n_chunks} chunks ({n_chunks * 128} bits). "
-                f"Maximum capacity for this audio is {capacity_chars} characters."
+                f"Audio too short for this message. Needs at least {needed_sec} seconds."
             )
 
         # 5. Tile message blocks cyclically across ALL chunks (chunk i carries block i % n_blocks)
-        if n_text_chunks < n_chunks:
-            full_bits = torch.zeros((n_chunks, PAYLOAD_BITS), dtype=text_bits.dtype)
-            for i in range(n_chunks):
-                full_bits[i] = text_bits[i % n_text_chunks]
-        else:
-            full_bits = text_bits
+        full_bits = torch.stack([text_bits[i % n_blocks] for i in range(n_chunks)], dim=0)
 
         # 6. Encode all chunks in batches of 8
         batch_size = 8
@@ -182,6 +184,42 @@ class StegoEngine:
         }
         return wav_bytes, info
 
+    def _decode_waveform_chunks(self, wave: torch.Tensor) -> Optional[str]:
+        """Compute chunk sigmoid probabilities, vote modulo candidate n_blocks, and try decoding."""
+        assert self.decoder is not None
+        chunks, _ = split_chunks(wave)
+        n_chunks = chunks.shape[0]
+        if n_chunks == 0:
+            return None
+
+        batch_size = 16
+        logits_list: List[torch.Tensor] = []
+
+        for i in range(0, n_chunks, batch_size):
+            sub_chunks = chunks[i : i + batch_size].to(self.device)
+            spec = stft(sub_chunks)
+            logits = self.decoder(spec)  # [B, 128]
+            logits_list.append(logits.cpu())
+
+        all_logits = torch.cat(logits_list, dim=0)  # [n_chunks, 128]
+
+        # (a) Compute sigmoid probabilities for every chunk
+        probs = torch.sigmoid(all_logits)
+
+        # (b) For each candidate n_blocks from 1 to n_chunks, average probabilities of chunks
+        # sharing the same index modulo n_blocks, threshold at 0.5, and try to decode.
+        for cand_n_blocks in range(1, n_chunks + 1):
+            avg_probs = torch.zeros((cand_n_blocks, PAYLOAD_BITS), dtype=torch.float32)
+            for b in range(cand_n_blocks):
+                avg_probs[b] = probs[b::cand_n_blocks].mean(dim=0)
+            voted_bits = (avg_probs >= 0.5).float()
+            try:
+                return chunk_bits_to_text(voted_bits)
+            except ValueError:
+                continue
+
+        return None
+
     @torch.no_grad()
     def extract(self, audio_bytes: bytes) -> str:
         """Extract secret message text from stego audio bytes.
@@ -193,89 +231,55 @@ class StegoEngine:
             str: Decoded secret message string.
 
         Raises:
-            ValueError: If message could not be recovered via Reed-Solomon error correction.
+            ValueError: With "Message could not be recovered" if extraction fails.
         """
         if self.decoder is None:
             self.load()
             assert self.decoder is not None
 
         wave = load_audio(audio_bytes)
-        chunks, _ = split_chunks(wave)
-        n_chunks = chunks.shape[0]
+        if wave.numel() == 0:
+            raise ValueError("Message could not be recovered")
 
-        if n_chunks == 0:
-            return ""
+        # Initial attempt (shift = 0): steps (a) and (b)
+        decoded = self._decode_waveform_chunks(wave)
+        if decoded is not None:
+            return decoded
 
-        batch_size = 8
-        logits_list: List[torch.Tensor] = []
+        # (c) Retry with audio shifted by 0 to 31999 samples (step 2000, crop and zero-pad,
+        # do not wrap around) and repeat (b). Shift 0 was already attempted above.
+        orig_chunks, _ = split_chunks(wave)
+        padded_len = orig_chunks.shape[0] * CHUNK_SAMPLES
 
-        for i in range(0, n_chunks, batch_size):
-            sub_chunks = chunks[i : i + batch_size].to(self.device)
-            spec = stft(sub_chunks)
-            logits = self.decoder(spec)  # [B, 128]
-            logits_list.append(logits.cpu())
-
-        all_logits = torch.cat(logits_list, dim=0)  # [n_chunks, 128]
-
-        # Compute sigmoid probabilities for every chunk
-        probs = torch.sigmoid(all_logits)
-
-        def _try_decode_with_k(k: int) -> Optional[str]:
-            """Average probabilities of chunks sharing same block index mod k and decode."""
-            if k <= 0 or k > n_chunks:
-                return None
-            avg_probs = torch.zeros((k, PAYLOAD_BITS), dtype=torch.float32)
-            for b in range(k):
-                matching = [probs[i] for i in range(n_chunks) if i % k == b]
-                avg_probs[b] = torch.stack(matching).mean(dim=0)
-            voted_bits = (avg_probs >= 0.5).float()
-            try:
-                return chunk_bits_to_text(voted_bits)
-            except ValueError:
-                return None
-
-        # 1. Decode block 0 first (contains 2-byte length header) to compute n_blocks
-        b0_bits = (probs[0] >= 0.5).to(torch.uint8).numpy()
-        b0_bytes = bytes(np.packbits(b0_bits).tobytes())
-        cand_len = int.from_bytes(b0_bytes[:2], byteorder="big")
-        cand_n_blocks = (cand_len + 10 + 15) // 16
-
-        if 1 <= cand_n_blocks <= min(n_chunks, 8):
-            decoded = _try_decode_with_k(cand_n_blocks)
+        for shift in range(2000, CHUNK_SAMPLES, 2000):
+            # Zero-pad start and crop to chunk-aligned length (re-aligns start-trimmed clips)
+            shifted_pad_start = F.pad(wave, (shift, 0), mode="constant", value=0.0)[:padded_len]
+            decoded = self._decode_waveform_chunks(shifted_pad_start)
             if decoded is not None:
                 return decoded
 
-        # Try decoding block 0 alone (e.g. single-block message)
-        try:
-            b0_alone_bits = (probs[0:1] >= 0.5).float()
-            return chunk_bits_to_text(b0_alone_bits)
-        except ValueError:
-            pass
+            # Crop start and zero-pad tail via split_chunks (re-aligns start-padded clips)
+            if wave.shape[0] > shift:
+                shifted_crop_start = wave[shift:]
+                decoded = self._decode_waveform_chunks(shifted_crop_start)
+                if decoded is not None:
+                    return decoded
 
-        # 2. If block 0 cannot be decoded alone, try voting across all chunks
-        # that share the same index modulo candidate n_blocks values 1 to 8,
-        # and pick the first that passes Reed-Solomon.
-        for cand_k in range(1, min(n_chunks, 8) + 1):
-            if cand_k == cand_n_blocks:
-                continue
-            decoded = _try_decode_with_k(cand_k)
-            if decoded is not None:
-                return decoded
-
+        # (d) Nothing passed magic, RS, and CRC
         raise ValueError("Message could not be recovered")
 
     def capacity(self, audio_bytes: bytes) -> int:
-        """Calculate maximum character capacity for an audio file.
+        """Calculate maximum UTF-8 byte capacity for an audio file.
 
         Args:
             audio_bytes: Audio file binary content.
 
         Returns:
-            int: Maximum allowable character payload length.
+            int: Maximum allowable UTF-8 byte payload length.
         """
         wave = load_audio(audio_bytes)
         chunks, _ = split_chunks(wave)
-        return max_text_length(chunks.shape[0])
+        return max_text_bytes(chunks.shape[0])
 
 
 def main() -> None:
@@ -340,7 +344,7 @@ def main() -> None:
             f"[Embed] Chunks: {info['n_chunks']} | "
             f"Duration: {info['duration_sec']}s | "
             f"SNR: {info['snr_db']} dB | "
-            f"Capacity: {info['capacity_chars']} chars"
+            f"Capacity: {info['capacity_chars']} bytes"
         )
 
     elif args.command == "extract":
@@ -358,7 +362,7 @@ def main() -> None:
         engine = StegoEngine(checkpoint_path=None, device=args.device)
         input_data = Path(args.input_audio).read_bytes()
         max_chars = engine.capacity(input_data)
-        print(f"[Capacity] Max text length: {max_chars} characters.")
+        print(f"[Capacity] Max text length: {max_chars} bytes.")
 
 
 if __name__ == "__main__":

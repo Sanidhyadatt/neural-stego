@@ -61,9 +61,9 @@ def test_skip_files_shorter_than_half_second(tmp_path: Path):
     assert bits.shape == (128,)
 
 
-def test_dataloader_smoke_and_shapes():
+def test_dataloader_smoke_and_shapes(tmp_path: Path):
     """Smoke test: builds a DataLoader (batch 4), prints tensor shapes, and verifies full pipeline."""
-    data_dir = Path("data")
+    data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Ensure data/ has audio files; if empty, generate 20 synthetic wav files
@@ -106,3 +106,38 @@ def test_dataloader_smoke_and_shapes():
     disc_logit = discriminator(stego_spec)
     print(f"[Smoke Test] Discriminator logit shape:   {disc_logit.shape}")
     assert disc_logit.shape == (4, 1)
+
+
+def test_two_percent_val_holdout_and_multi_dir(tmp_path: Path):
+    """Verify 2% validation hold-out split and multiple root_dir support."""
+    dir_a = tmp_path / "dir_a"
+    dir_b = tmp_path / "dir_b"
+    generate_synthetic_data(dir_a, num_files=50)
+    generate_synthetic_data(dir_b, num_files=50)
+
+    train_ds = StegoDataset([dir_a, dir_b], split="train", auto_generate_synthetic=False)
+    val_ds = StegoDataset([dir_a, dir_b], split="val", auto_generate_synthetic=False)
+
+    assert len(train_ds) == 98
+    assert len(val_ds) == 2
+    assert set(train_ds.file_list).isdisjoint(set(val_ds.file_list))
+
+
+def test_skip_silent_chunks(tmp_path: Path):
+    """Verify chunks with RMS below 0.005 are skipped in favor of active audio regions."""
+    audio_dir = tmp_path / "mostly_silent"
+    audio_dir.mkdir(parents=True)
+
+    # Create a 6-second file: first 4s pure silence, last 2s active 440 Hz tone
+    sr = 16000
+    silence = np.zeros(sr * 4, dtype=np.float32)
+    t = np.linspace(0.0, 2.0, sr * 2, endpoint=False, dtype=np.float32)
+    active = (0.5 * np.sin(2.0 * np.pi * 440.0 * t)).astype(np.float32)
+    combined = np.concatenate([silence, active])
+    sf.write(str(audio_dir / "partial_silence.wav"), combined, sr, subtype="PCM_16")
+
+    ds = StegoDataset(audio_dir, split="train", auto_generate_synthetic=False)
+    for _ in range(10):
+        chunk, _ = ds[0]
+        rms = float(torch.sqrt(torch.mean(chunk ** 2)).item())
+        assert rms >= 0.005, f"Returned chunk had silent RMS={rms}"
